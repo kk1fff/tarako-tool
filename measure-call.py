@@ -305,11 +305,12 @@ class SingleProcInfo:
         self._parse_stat()
 
     def _parse_stat(self):
-        m = re.search(r'^(\d+) \(.*\) \w+ \d+ \d+ \d+ \d+ [0-9-]+ \d+ (\d+) \d+ (\d+) \d+ (\d+) (\d+)', self._stat)
-        self._minflt = int(m.group(2))
-        self._majflt = int(m.group(3))
-        self._utime = int(m.group(4))
-        self._stime = int(m.group(5))
+        m = re.search(r'^(\d+) \((.*)\) \w+ \d+ \d+ \d+ \d+ [0-9-]+ \d+ (\d+) \d+ (\d+) \d+ (\d+) (\d+)', self._stat)
+        self._name = m.group(2)
+        self._minflt = int(m.group(3))
+        self._majflt = int(m.group(4))
+        self._utime = int(m.group(5))
+        self._stime = int(m.group(6))
 
     def _parse_smaps(self):
         if self._smaps == None:
@@ -356,6 +357,9 @@ class SingleProcInfo:
 
     def smaps(self):
         return self._smaps
+
+    def name(self):
+        return self._name
 
 def get_system_proc_stat():
     catproc = subprocess.Popen(['adb', 'shell', 'getsysstat'], stdout = subprocess.PIPE)
@@ -518,7 +522,8 @@ for proc in procInfo['proc']:
     if proc.pid() in procStatEndMap:
         diff = procStatEndMap[proc.pid()].diff(proc)
         if diff != None:
-            wholeSystemProc = wholeSystemProc + "{0:5}{1:6.02f}{2:6.02f}\n".format(diff.pid(), diff.utime(), diff.stime())
+            wholeSystemProc = wholeSystemProc + "{:5} {:6.02f} {:6.02f} {}\n".format(diff.pid(), diff.utime(),
+                                                                                     diff.stime(), procStatEndMap[proc.pid()].name())
 
 procData = """
 system
