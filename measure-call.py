@@ -130,8 +130,9 @@ class ProcInfo:
                                                    int(m.group(10)))
 
 class SingleProcInfoDiff:
-    def __init__(self, diff):
+    def __init__(self, pid, diff):
         self._diff = diff
+        self._pid = pid
 
     def duration(self):
         return (float)(self._diff['time_delta'].seconds) + float(self._diff['time_delta'].microseconds) / 1000000.0
@@ -148,19 +149,28 @@ class SingleProcInfoDiff:
     def stime(self):
         return (float)(self._diff['stime']) / 100.0
 
+    def pid(self):
+        return self._pid
+
 class SingleProcInfo:
-    def __init__(self, pid):
-        self._time = datetime.datetime.now()
-        self._stat = call_and_store(['cat', '/proc/{0}/stat'.format(pid)])
-        self._statm =  call_and_store(['cat', '/proc/{0}/statm'.format(pid)])
-        self._smaps =  call_and_store(['cat', '/proc/{0}/smaps'.format(pid)])
-        self._pid = pid
+    def __init__(self, pid = 0, stat = None, time = None):
+        if pid != 0:
+            self._time = datetime.datetime.now()
+            self._stat = call_and_store(['cat', '/proc/{0}/stat'.format(pid)])
+        elif stat != None and time != None:
+            self._time = time
+            self._stat = stat
+        m = re.search(r'^(\d+) ', self._stat)
+        self._pid = int(m.group(1)) if m != None else 0
         self._parsed = False
 
     def diff(self, old):
+        if self._pid != old._pid:
+            return None
+
         self._parse()
         old._parse()
-        return SingleProcInfoDiff({
+        return SingleProcInfoDiff(self._pid, {
             'time_delta': self._time - old._time,
             'minflt':     self._minflt - old._minflt,
             'majflt':     self._majflt - old._majflt,
@@ -172,7 +182,6 @@ class SingleProcInfo:
         if self._parsed:
             return
         self._parse_stat()
-        self._parse_statm()
 
     def _parse_stat(self):
         m = re.search(r'^(\d+) \(.*\) \w+ \d+ \d+ \d+ \d+ [0-9-]+ \d+ (\d+) \d+ (\d+) \d+ (\d+) (\d+)', self._stat)
@@ -181,8 +190,37 @@ class SingleProcInfo:
         self._utime = int(m.group(4))
         self._stime = int(m.group(5))
 
-    def _parse_statm(self):
-        pass
+    def pid(self):
+        return self._pid
+
+def get_system_proc_stat():
+    ls = subprocess.Popen(['adb', 'shell', 'ls', 'proc'], stdout = subprocess.PIPE)
+    proc = []
+    while True:
+        l = ls.stdout.readline().decode('utf-8')
+        if l == "":
+            break
+        m = re.search(r'^(\d+)$', l.strip())
+        if m != None:
+            proc.append(int(m.group(1)))
+    ls = None
+
+    rets = []
+    now = datetime.datetime.now()
+    while len(proc) > 0:
+        cmd = ['adb', 'shell', 'cat']
+        count = 0
+        while len(proc) > 0 and count < 10:
+            cmd.append('/proc/{0}/stat'.format(proc.pop()))
+            count = count + 1
+
+        catproc = subprocess.Popen(cmd, stdout = subprocess.PIPE)
+        while True:
+            l = catproc.stdout.readline().decode('utf-8')
+            if l == "":
+                break;
+            rets.append(SingleProcInfo(stat = l, time = now))
+    return rets
 
 class ProcWatcher(threading.Thread):
     def __init__(self, preallocated_pid, b2g_pid):
@@ -199,7 +237,8 @@ class ProcWatcher(threading.Thread):
             buf = {
                 'system': ProcInfo(),
                 'prea':   SingleProcInfo(self._preallocated_pid),
-                'b2g':    SingleProcInfo(self._b2g_pid)
+                'b2g':    SingleProcInfo(self._b2g_pid),
+                'proc':   get_system_proc_stat()
             }
 
             self._buf_lock.acquire()
@@ -318,6 +357,27 @@ commProcInfoEnd = SingleProcInfo(preallocated_pid)
 b2gProcInfoDiff = b2gProcInfoEnd.diff(procInfo['b2g'])
 commProcInfoDiff = commProcInfoEnd.diff(procInfo['prea'])
 
+print "1"
+
+# whole system data
+wholeSystemProc = ""
+procStatEnd = get_system_proc_stat()
+procStatEndMap = dict()
+for proc in procStatEnd:
+    procStatEndMap[proc.pid()] = proc
+
+print "2"
+
+for proc in procInfo['proc']:
+    if proc.pid() == 0:
+        continue
+    if proc.pid() in procStatEndMap:
+        diff = procStatEndMap[proc.pid()].diff(proc)
+        if diff != None:
+            wholeSystemProc = wholeSystemProc + "{0:5}{1:6.02}{2:6.02}\n".format(diff.pid(), diff.utime(), diff.stime())
+
+print "3"
+
 procData = """
 system
 duration: {0}
@@ -344,6 +404,9 @@ majflt:   {16}
 minflt:   {17}
 utime:    {18} secs
 stime:    {19} secs
+
+{20}
+
 """.format(procInfoDiff.duration(),
            procInfoDiff.user() * 100.0,
            procInfoDiff.sys() * 100.0,
@@ -363,7 +426,8 @@ stime:    {19} secs
            commProcInfoDiff.majflt(),
            commProcInfoDiff.minflt(),
            commProcInfoDiff.utime(),
-           commProcInfoDiff.stime())
+           commProcInfoDiff.stime(),
+           wholeSystemProc)
 
 print procData
 logb.write(procData)
