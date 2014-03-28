@@ -87,6 +87,7 @@ class ProcInfo:
         # parse data
         self._parse_vmstat()
         self._parse_stat()
+        self._is_read = True
 
     def _parse_vmstat(self):
         self._vmstat_data = dict()
@@ -112,32 +113,94 @@ class ProcInfo:
                 self._stat_data['cpu'] = {
                     'user': int(m.group(1)),
                     'nice': int(m.group(2)),
-                    'sys': int(m.group(3)),
+                    'sys':  int(m.group(3)),
                     'idle': int(m.group(4)),
-                    'iow': int(m.group(5)),
-                    'irq': int(m.group(6)),
+                    'iow':  int(m.group(5)),
+                    'irq':  int(m.group(6)),
                     'sirq': int(m.group(7)),
 
                     # virtualized
-                    'stolen': int(m.group(8)),
-                    'gst': int(m.group(9)),
+                    'stolen':   int(m.group(8)),
+                    'gst':      int(m.group(9)),
                     'gst_nice': int(m.group(9))
                 }
                 self._stat_data['cpu']['total'] = (int(m.group(1)) + int(m.group(2)) + int(m.group(3)) +
                                                    int(m.group(4)) + int(m.group(5)) + int(m.group(6)) +
                                                    int(m.group(7)) + int(m.group(8)) + int(m.group(9)) +
                                                    int(m.group(10)))
+
+class SingleProcInfoDiff:
+    def __init__(self, diff):
+        self._diff = diff
+
+    def duration(self):
+        return (float)(self._diff['time_delta'].seconds) + float(self._diff['time_delta'].microseconds) / 1000000.0
+
+    def minflt(self):
+        return self._diff['minflt']
+
+    def majflt(self):
+        return self._diff['majflt']
+
+    def utime(self):
+        return (float)(self._diff['utime']) / 100.0
+
+    def stime(self):
+        return (float)(self._diff['stime']) / 100.0
+
+class SingleProcInfo:
+    def __init__(self, pid):
+        self._time = datetime.datetime.now()
+        self._stat = call_and_store(['cat', '/proc/{0}/stat'.format(pid)])
+        self._statm =  call_and_store(['cat', '/proc/{0}/statm'.format(pid)])
+        self._smaps =  call_and_store(['cat', '/proc/{0}/smaps'.format(pid)])
+        self._pid = pid
+        self._parsed = False
+
+    def diff(self, old):
+        self._parse()
+        old._parse()
+        return SingleProcInfoDiff({
+            'time_delta': self._time - old._time,
+            'minflt':     self._minflt - old._minflt,
+            'majflt':     self._majflt - old._majflt,
+            'utime':      self._utime - old._utime,
+            'stime':      self._stime - old._stime
+        })
+
+    def _parse(self):
+        if self._parsed:
+            return
+        self._parse_stat()
+        self._parse_statm()
+
+    def _parse_stat(self):
+        m = re.search(r'^(\d+) \(.*\) \w+ \d+ \d+ \d+ \d+ [0-9-]+ \d+ (\d+) \d+ (\d+) \d+ (\d+) (\d+)', self._stat)
+        self._minflt = int(m.group(2))
+        self._majflt = int(m.group(3))
+        self._utime = int(m.group(4))
+        self._stime = int(m.group(5))
+
+    def _parse_statm(self):
+        pass
+
 class ProcWatcher(threading.Thread):
-    def __init__(self):
+    def __init__(self, preallocated_pid, b2g_pid):
         super(ProcWatcher, self).__init__()
         self._still_run_lock = threading.Lock()
         self._still_run = True
         self._buf_lock = threading.Lock()
         self._buf = None
+        self._preallocated_pid = preallocated_pid
+        self._b2g_pid = b2g_pid
 
     def run(self):
         while self.still_run():
-            buf = ProcInfo()
+            buf = {
+                'system': ProcInfo(),
+                'prea':   SingleProcInfo(self._preallocated_pid),
+                'b2g':    SingleProcInfo(self._b2g_pid)
+            }
 
             self._buf_lock.acquire()
             self._buf = buf
@@ -162,6 +225,22 @@ class ProcWatcher(threading.Thread):
         self._buf_lock.release()
         return buf
         
+def get_pid(app):
+    b2ginfo = subprocess.Popen(['adb', 'shell', 'b2g-ps'], stdout=subprocess.PIPE)
+    pid = 0
+    while True:
+        l = b2ginfo.stdout.readline().decode('utf-8')
+        if l == "":
+            break
+        m = re.search(app, l.strip())
+        if m == None:
+            continue
+        m = re.search(r'^(\d+)', l[27:])
+        pid = int(m.group(1))
+        break
+
+    b2ginfo.terminate()
+    return pid
 
 def signal_handler(signal, frame):
     print "Got Ctrl-C, terminate"
@@ -171,17 +250,7 @@ def signal_handler(signal, frame):
     sys.exit(0)
 
 def killapp(app):
-    b2ginfo = subprocess.Popen(['adb', 'shell', 'b2g-ps'], stdout=subprocess.PIPE)
-    pid = 0
-    while True:
-        l = b2ginfo.stdout.readline().decode('utf-8')
-        if l == "":
-            break
-        m = re.search(r'^' + app + r'[ \t]+app_[0-9]+[ \t]+([0-9]+)', l.strip())
-        if m != None:
-            pid = int(m.group(1))
-            break
-    b2ginfo.terminate()
+    pid = get_pid(app)
     if pid > 0:
         subprocess.call(['adb', 'shell', 'kill', '-9', str(pid)])
         print "Kill {0}({1}).".format(app, pid)
@@ -194,10 +263,15 @@ def cleanlog():
 ################################################################################
 # Start
 
-
 killapp('Communications')
+
+# clean log
 cleanlog()
-procWatcher = ProcWatcher()
+
+# get proc info
+b2g_pid = get_pid('b2g')
+preallocated_pid = get_pid('Preallocated')
+procWatcher = ProcWatcher(preallocated_pid, b2g_pid)
 procWatcher.start()
 
 logb = StringIO.StringIO()
@@ -237,9 +311,15 @@ while True:
         print "Ringing: {0:.3f}".format(float(ring - cs)/1000000000.0)
         break
 
-procInfoDiff = ProcInfo().diff(procInfo)
+procInfoDiff = ProcInfo().diff(procInfo['system'])
+b2gProcInfoEnd = SingleProcInfo(b2g_pid)
+commProcInfoEnd = SingleProcInfo(preallocated_pid)
+
+b2gProcInfoDiff = b2gProcInfoEnd.diff(procInfo['b2g'])
+commProcInfoDiff = commProcInfoEnd.diff(procInfo['prea'])
 
 procData = """
+system
 duration: {0}
 user:     {1:.2f}%
 sys:      {2:.2f}% 
@@ -253,6 +333,17 @@ pgout:    {9}
 swpin:    {10}
 swpout:   {11}
 
+b2g
+majflt:   {12}
+minflt:   {13}
+utime:    {14} secs
+stime:    {15} secs
+
+comms
+majflt:   {16}
+minflt:   {17}
+utime:    {18} secs
+stime:    {19} secs
 """.format(procInfoDiff.duration(),
            procInfoDiff.user() * 100.0,
            procInfoDiff.sys() * 100.0,
@@ -264,7 +355,15 @@ swpout:   {11}
            procInfoDiff.pgin(),
            procInfoDiff.pgout(),
            procInfoDiff.swpin(),
-           procInfoDiff.swpout())
+           procInfoDiff.swpout(),
+           b2gProcInfoDiff.majflt(),
+           b2gProcInfoDiff.minflt(),
+           b2gProcInfoDiff.utime(),
+           b2gProcInfoDiff.stime(),
+           commProcInfoDiff.majflt(),
+           commProcInfoDiff.minflt(),
+           commProcInfoDiff.utime(),
+           commProcInfoDiff.stime())
 
 print procData
 logb.write(procData)
