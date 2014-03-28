@@ -24,10 +24,14 @@ class ProcInfoDiff:
         return (float)(self._diff['time_delta'].seconds) + float(self._diff['time_delta'].microseconds) / 1000000.0
     def user(self):
         return (float)(self._diff['user'])/(float)(self._diff['tick'])
+    def utime(self):
+        return (float)(self._diff['user'])/100.0
     def nice(self):
         return (float)(self._diff['nice'])/(float)(self._diff['tick'])
     def sys(self):
         return (float)(self._diff['sys'])/(float)(self._diff['tick'])
+    def stime(self):
+        return (float)(self._diff['sys'])/100.0
     def idle(self):
         return (float)(self._diff['idle'])/(float)(self._diff['tick'])
     def iow(self):
@@ -194,32 +198,16 @@ class SingleProcInfo:
         return self._pid
 
 def get_system_proc_stat():
-    ls = subprocess.Popen(['adb', 'shell', 'ls', 'proc'], stdout = subprocess.PIPE)
-    proc = []
-    while True:
-        l = ls.stdout.readline().decode('utf-8')
-        if l == "":
-            break
-        m = re.search(r'^(\d+)$', l.strip())
-        if m != None:
-            proc.append(int(m.group(1)))
-    ls = None
-
+    catproc = subprocess.Popen(['adb', 'shell', 'getsysstat'], stdout = subprocess.PIPE)
     rets = []
     now = datetime.datetime.now()
-    while len(proc) > 0:
-        cmd = ['adb', 'shell', 'cat']
-        count = 0
-        while len(proc) > 0 and count < 10:
-            cmd.append('/proc/{0}/stat'.format(proc.pop()))
-            count = count + 1
-
-        catproc = subprocess.Popen(cmd, stdout = subprocess.PIPE)
-        while True:
-            l = catproc.stdout.readline().decode('utf-8')
-            if l == "":
-                break;
-            rets.append(SingleProcInfo(stat = l, time = now))
+    while True:
+        l = catproc.stdout.readline().decode('utf-8')
+        if l == "":
+            break
+        if l.strip() == "":
+            continue
+        rets.append(SingleProcInfo(stat = l, time = now))
     return rets
 
 class ProcWatcher(threading.Thread):
@@ -357,8 +345,6 @@ commProcInfoEnd = SingleProcInfo(preallocated_pid)
 b2gProcInfoDiff = b2gProcInfoEnd.diff(procInfo['b2g'])
 commProcInfoDiff = commProcInfoEnd.diff(procInfo['prea'])
 
-print "1"
-
 # whole system data
 wholeSystemProc = ""
 procStatEnd = get_system_proc_stat()
@@ -366,50 +352,46 @@ procStatEndMap = dict()
 for proc in procStatEnd:
     procStatEndMap[proc.pid()] = proc
 
-print "2"
-
 for proc in procInfo['proc']:
     if proc.pid() == 0:
         continue
     if proc.pid() in procStatEndMap:
         diff = procStatEndMap[proc.pid()].diff(proc)
         if diff != None:
-            wholeSystemProc = wholeSystemProc + "{0:5}{1:6.02}{2:6.02}\n".format(diff.pid(), diff.utime(), diff.stime())
-
-print "3"
+            wholeSystemProc = wholeSystemProc + "{0:5}{1:6.02f}{2:6.02f}\n".format(diff.pid(), diff.utime(), diff.stime())
 
 procData = """
 system
-duration: {0}
-user:     {1:.2f}%
-sys:      {2:.2f}% 
-nice:     {3:.2f}%
-idle:     {4:.2f}%
-iowait:   {5:.2f}%
-irq:      {6:.2f}%
-sirq:     {7:.2f}%
-pgin:     {8}
-pgout:    {9}
-swpin:    {10}
-swpout:   {11}
+duration: {}
+user:     {:.2f}% {} sec
+sys:      {:.2f}% {} sec
+nice:     {:.2f}%
+idle:     {:.2f}%
+iowait:   {:.2f}%
+irq:      {:.2f}%
+sirq:     {:.2f}%
+pgin:     {}
+pgout:    {}
+swpin:    {}
+swpout:   {}
 
-b2g
-majflt:   {12}
-minflt:   {13}
-utime:    {14} secs
-stime:    {15} secs
+b2g({})
+majflt:   {}
+minflt:   {}
+utime:    {} secs
+stime:    {} secs
 
-comms
-majflt:   {16}
-minflt:   {17}
-utime:    {18} secs
-stime:    {19} secs
+comms({})
+majflt:   {}
+minflt:   {}
+utime:    {} secs
+stime:    {} secs
 
-{20}
+{}
 
 """.format(procInfoDiff.duration(),
-           procInfoDiff.user() * 100.0,
-           procInfoDiff.sys() * 100.0,
+           procInfoDiff.user() * 100.0, procInfoDiff.utime(),
+           procInfoDiff.sys() * 100.0, procInfoDiff.stime(),
            procInfoDiff.nice() * 100.0,
            procInfoDiff.idle() * 100.0,
            procInfoDiff.iow() * 100.0,
@@ -419,10 +401,12 @@ stime:    {19} secs
            procInfoDiff.pgout(),
            procInfoDiff.swpin(),
            procInfoDiff.swpout(),
+           b2g_pid,
            b2gProcInfoDiff.majflt(),
            b2gProcInfoDiff.minflt(),
            b2gProcInfoDiff.utime(),
            b2gProcInfoDiff.stime(),
+           preallocated_pid,
            commProcInfoDiff.majflt(),
            commProcInfoDiff.minflt(),
            commProcInfoDiff.utime(),
