@@ -133,6 +133,100 @@ class ProcInfo:
                                                    int(m.group(7)) + int(m.group(8)) + int(m.group(9)) +
                                                    int(m.group(10)))
 
+class MapInfoDiff:
+    def __init__(self, name, start, size, permission, diff):
+        self._diff = diff
+        self._file = name
+        self._start = start
+        self._size = size
+        self._permission = permission
+
+    def report(self):
+        d = self._diff
+        return "{:50} {:10d} {:10d} {:10d} {:10d} {:10d} {:10d} {:10d} {:10d}".format(self._name()[:50],
+                                                                                      self._size,
+                                                                                      d['rss'], d['pss'], d['sc'], d['sd'], d['pc'],
+                                                                                      d['pd'], d['swap'])
+
+    def _name(self):
+        if self._file != None:
+            return self._file
+        else:
+            return "{:x} {}".format(self._start, self._permission)
+
+class MapInfo:
+    def __init__(self):
+        self._start = -1
+
+    def feed(self, line):
+        if self._start == -1:
+            return self._parse_firstline(line)
+        else:
+            return self._parse_value(line)
+
+    def _parse_firstline(self, line):
+        # be9f3000-bea14000 rw-p 00000000 00:00 0          [stack]
+        m = re.search(r'([0-9a-f]+)-([0-9a-f]+) ([r-][w-][x-][ps]) ([0-9a-f]+) [0-9a-f]{2}:[0-9a-f]{2} [0-9]+(.+|)$', line.strip())
+        if m == None:
+            raise Exception("Can not parse first line of smaps: '"+ line.strip() + "'")
+
+        self._start = int(m.group(1), 16)
+        self._end = int(m.group(2), 16)
+        self._permission = m.group(3)
+        self._offset = int(m.group(4), 16)
+        self._file = m.group(5).strip() if m.group(5) != '' else None
+        return True
+ 
+    def _parse_value(self, line):
+        m = re.search(r'([A-Za-z0-9_]+):[ \t]+([0-9]+) kB', line.strip())
+        if m == None:
+            return False
+        name = m.group(1)
+        value = int(m.group(2))
+
+        if name == "Size":
+            self._size = value
+        elif name == "Rss":
+            self._rss = value
+        elif name == "Pss":
+            self._pss = value
+        elif name == "Shared_Clean":
+            self._shared_clean = value
+        elif name == "Shared_Dirty":
+            self._shared_dirty = value
+        elif name == "Private_Clean":
+            self._private_clean = value
+        elif name == "Private_Dirty":
+            self._private_dirty = value
+        elif name == "Swap":
+            self._swap = value
+        return True
+
+    def diff(self, old):
+        # return None if they are considered as difference maps
+        if self._size != old._size:
+            return None
+        if self._file != old._file:
+            return None
+        return MapInfoDiff(self._file, self._start, self._size, self._permission, {
+            'rss': self._rss - old._rss,
+            'pss': self._pss - old._pss,
+            'sc': self._shared_clean - old._shared_clean,
+            'sd': self._shared_dirty - old._shared_dirty,
+            'pc': self._private_clean - old._private_clean,
+            'pd': self._private_dirty - old._private_dirty,
+            'swap': self._swap - old._swap
+        });
+
+    def start(self):
+        return self._start
+
+    def report(self):
+        return "{:50} {:10d} {:10d} {:10d} {:10d} {:10d} {:10d} {:10d} {:10d}".format(self._file[:50] if self._file != None else "{:x} {}".format(self.start(), self._permission),
+                                                                                      self._size, self._rss, self._pss, self._shared_clean,
+                                                                                      self._shared_dirty, self._private_clean, self._private_dirty,
+                                                                                      self._swap)
+
 class SingleProcInfoDiff:
     def __init__(self, pid, diff):
         self._diff = diff
@@ -156,17 +250,38 @@ class SingleProcInfoDiff:
     def pid(self):
         return self._pid
 
+    def reportMapDiff(self):
+        if self._diff['smaps'] == None:
+            return ""
+        ret = ""
+        ret = ret + "diff:\n"
+
+        for mapdiff in self._diff['smaps']['diff']:
+            ret = ret + mapdiff.report() + "\n"
+
+        ret = ret + "created:\n"
+        for maps in self._diff['smaps']['created']:
+            ret = ret + maps.report() + "\n"
+
+        ret = ret + "deleted:\n"
+        for maps in self._diff['smaps']['deleted']:
+            ret = ret + maps.report() + "\n"
+        return ret
+
 class SingleProcInfo:
     def __init__(self, pid = 0, stat = None, time = None):
         if pid != 0:
             self._time = datetime.datetime.now()
             self._stat = call_and_store(['cat', '/proc/{0}/stat'.format(pid)])
+            self._smaps = call_and_store(['cat', '/proc/{}/smaps'.format(pid)])
         elif stat != None and time != None:
             self._time = time
             self._stat = stat
+            self._smaps = None
         m = re.search(r'^(\d+) ', self._stat)
         self._pid = int(m.group(1)) if m != None else 0
         self._parsed = False
+        self._smaps_data = None
 
     def diff(self, old):
         if self._pid != old._pid:
@@ -179,10 +294,12 @@ class SingleProcInfo:
             'minflt':     self._minflt - old._minflt,
             'majflt':     self._majflt - old._majflt,
             'utime':      self._utime - old._utime,
-            'stime':      self._stime - old._stime
+            'stime':      self._stime - old._stime,
+            'smaps':      self._diff_smaps(old)
         })
 
     def _parse(self):
+        self._parse_smaps()
         if self._parsed:
             return
         self._parse_stat()
@@ -194,8 +311,51 @@ class SingleProcInfo:
         self._utime = int(m.group(4))
         self._stime = int(m.group(5))
 
+    def _parse_smaps(self):
+        if self._smaps == None:
+            return
+        self._smaps_data = {}
+        reader = StringIO.StringIO(self._smaps)
+        mapInfo = None
+        while True:
+            l = reader.readline()
+            if l == "":
+                if mapInfo != None:
+                    self._smaps_data[mapInfo.start()] = mapInfo
+                break
+            if mapInfo == None:
+                mapInfo = MapInfo()
+            if mapInfo.feed(l) == False:
+                self._smaps_data[mapInfo.start()] = mapInfo
+                mapInfo = MapInfo()
+                mapInfo.feed(l)
+
+    def _diff_smaps(self, old):
+        if self._smaps_data == None or old._smaps_data == None:
+            return None
+
+        diffs = []
+        for addr in self._smaps_data.keys():
+            if addr in old._smaps_data:
+                diff = self._smaps_data[addr].diff(old._smaps_data[addr])
+                if diff != None:
+                    diffs.append(diff)
+                    del self._smaps_data[addr]
+                    del old._smaps_data[addr]
+        created = self._smaps_data
+        deleted = old._smaps_data
+        return {
+            'diff': diffs,
+            'created': created.values(),
+            'deleted': deleted.values()
+        }
+        
+
     def pid(self):
         return self._pid
+
+    def smaps(self):
+        return self._smaps
 
 def get_system_proc_stat():
     catproc = subprocess.Popen(['adb', 'shell', 'getsysstat'], stdout = subprocess.PIPE)
@@ -389,6 +549,12 @@ stime:    {} secs
 
 {}
 
+map diff:
+b2g:
+{}
+
+comms:
+{}
 """.format(procInfoDiff.duration(),
            procInfoDiff.user() * 100.0, procInfoDiff.utime(),
            procInfoDiff.sys() * 100.0, procInfoDiff.stime(),
@@ -411,9 +577,12 @@ stime:    {} secs
            commProcInfoDiff.minflt(),
            commProcInfoDiff.utime(),
            commProcInfoDiff.stime(),
-           wholeSystemProc)
+           wholeSystemProc,
+           b2gProcInfoDiff.reportMapDiff(),
+           commProcInfoDiff.reportMapDiff())
 
 print procData
+
 logb.write(procData)
 logb.write("Ringing: {0:.3f}\n".format(float(ring - cs)/1000000000.0))
 
